@@ -1,0 +1,12 @@
+FOLDER|Armas de soft
+ATTR_TEXT|Descripción
+ATTR_TAG|Tipo de arma|#FFFFFF
+OBJECT|GLAD1|Gladius
+VAL_TEXT|Espada corta de 65 cm|true
+VAL_TAG|Gladius|true
+END_OBJECT
+OBJECT|LANZ1|Copito
+VAL_TEXT|Lanza de dos puntas de 160cm|true
+VAL_TAG|Asta larga|true
+END_OBJECT
+END_FOLDER

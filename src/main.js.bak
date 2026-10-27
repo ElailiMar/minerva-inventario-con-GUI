@@ -1,0 +1,244 @@
+
+const { invoke } = window.__TAURI__.core;
+
+let folders = [];
+let currentFolderId = 0;
+let undoHistory = [];
+
+const $ = (selector) => document.querySelector(selector);
+
+function currentFolder() {
+  return folders.find(folder => folder.id === currentFolderId);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;"
+  })[character]);
+}
+
+function saveUndoState() {
+  // El historial de deshacer aún no está conectado al backend.
+  undoHistory.push(JSON.stringify(folders));
+  if (undoHistory.length > 30) undoHistory.shift();
+}
+
+function showToast(message) {
+  const toast = $("#toast");
+  toast.textContent = message;
+  toast.classList.add("visible");
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(
+    () => toast.classList.remove("visible"),
+    2600
+  );
+}
+
+function showError(error) {
+  console.error(error);
+  showToast(String(error));
+}
+
+async function refreshInventory(selectId = currentFolderId) {
+  try {
+    folders = await invoke("get_inventory");
+
+    if (!folders.some(folder => folder.id === selectId)) {
+      currentFolderId = folders[0]?.id ?? 0;
+    } else {
+      currentFolderId = selectId;
+    }
+
+    render();
+  } catch (error) {
+    showError(`No se pudo cargar el inventario: ${error}`);
+  }
+}
+
+function renderFolders() {
+  $("#folder-list").innerHTML = folders.map(folder => `
+    <button class="folder-item ${folder.id === currentFolderId ? "selected" : ""}"
+            data-folder-id="${folder.id}">
+      <span class="folder-symbol">▰</span>
+      <span>${escapeHtml(folder.name)}</span>
+      <span class="folder-total">${folder.objects.length}</span>
+    </button>
+  `).join("");
+
+  $("#folder-list").querySelectorAll("[data-folder-id]").forEach(button => {
+    button.addEventListener("click", () => {
+      currentFolderId = Number(button.dataset.folderId);
+      render();
+    });
+  });
+}
+
+function renderObjects() {
+  const folder = currentFolder();
+
+  if (!folder) {
+    $("#object-count").textContent = "0";
+    $("#object-list").innerHTML = "";
+    $("#empty-state").hidden = false;
+    return;
+  }
+
+  const query = $("#search-input").value.trim().toLowerCase();
+
+  const filteredObjects = folder.objects.filter(object =>
+    object.name.toLowerCase().includes(query) ||
+    object.description.toLowerCase().includes(query)
+  );
+
+  $("#object-count").textContent = folder.objects.length;
+
+  $("#object-list").innerHTML = filteredObjects.map(object => `
+    <tr>
+      <td>${escapeHtml(object.name)}</td>
+      <td>${escapeHtml(object.description || "Sin descripción")}</td>
+      <td style="text-align:right">
+        <button class="delete-object"
+                data-delete-id="${object.id}"
+                title="Eliminar objeto"
+                aria-label="Eliminar ${escapeHtml(object.name)}">✕</button>
+      </td>
+    </tr>
+  `).join("");
+
+  $("#empty-state").hidden = filteredObjects.length > 0;
+
+  $("#object-list").querySelectorAll("[data-delete-id]").forEach(button => {
+    button.addEventListener("click", async () => {
+      const objectId = Number(button.dataset.deleteId);
+      const object = folder.objects.find(item => item.id === objectId);
+
+      if (!object) return;
+      if (!confirm(`¿Eliminar el objeto "${object.name}"?`)) return;
+
+      try {
+        saveUndoState();
+        folders = await invoke("delete_object", {
+          folderIndex: folder.id,
+          objectIndex: objectId
+        });
+
+        render();
+        showToast("Objeto eliminado.");
+      } catch (error) {
+        showError(error);
+      }
+    });
+  });
+}
+
+function render() {
+  const folder = currentFolder();
+
+  $("#folder-count").textContent = folders.length;
+
+  if (folder) {
+    $("#current-folder-name").textContent = folder.name;
+    $("#page-title").textContent = `Carpeta ${folder.name}`;
+  } else {
+    $("#current-folder-name").textContent = "Sin carpetas";
+    $("#page-title").textContent = "Inventario";
+  }
+
+  renderFolders();
+  renderObjects();
+}
+
+function openDialog(id) {
+  $(id).showModal();
+}
+
+document.querySelectorAll("[data-close]").forEach(button => {
+  button.addEventListener("click", () => {
+    $(`#${button.dataset.close}`).close();
+  });
+});
+
+$("#add-folder").addEventListener("click", () => {
+  $("#folder-name").value = "";
+  openDialog("#folder-dialog");
+  $("#folder-name").focus();
+});
+
+$("#folder-form").addEventListener("submit", async event => {
+  event.preventDefault();
+
+  const name = $("#folder-name").value.trim();
+  if (!name) return;
+
+  try {
+    saveUndoState();
+
+    folders = await invoke("create_folder", { name });
+    const created = folders.find(
+      folder => folder.name.toLowerCase() === name.toLowerCase()
+    );
+
+    currentFolderId = created?.id ?? folders[0]?.id ?? 0;
+
+    $("#folder-dialog").close();
+    render();
+    showToast("Carpeta creada y guardada.");
+  } catch (error) {
+    showError(error);
+  }
+});
+
+function openObjectDialog() {
+  $("#object-name").value = "";
+  $("#object-description").value = "";
+  openDialog("#object-dialog");
+  $("#object-name").focus();
+}
+
+$("#new-object").addEventListener("click", openObjectDialog);
+$("#empty-new-object").addEventListener("click", openObjectDialog);
+
+$("#object-form").addEventListener("submit", async event => {
+  event.preventDefault();
+
+  const name = $("#object-name").value.trim();
+  const description = $("#object-description").value.trim();
+  const folder = currentFolder();
+
+  if (!name || !folder) return;
+
+  try {
+    saveUndoState();
+
+    folders = await invoke("create_object", {
+      folderIndex: folder.id,
+      name,
+      description
+    });
+
+    $("#object-dialog").close();
+    render();
+    showToast("Objeto creado y guardado.");
+  } catch (error) {
+    showError(error);
+  }
+});
+
+$("#search-input").addEventListener("input", renderObjects);
+
+$("#undo-button").addEventListener("click", () => {
+  showToast(
+    "Deshacer todavía no está conectado al almacenamiento de Rust."
+  );
+});
+
+$("#nav-inventory").addEventListener("click", () => {
+  currentFolderId = folders[0]?.id ?? 0;
+  render();
+});
+
+refreshInventory();

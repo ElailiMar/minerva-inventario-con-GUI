@@ -1,0 +1,256 @@
+
+mod model;
+
+use model::{
+    AttributeValue, DynamicArray, Folder, InventoryObject, LinkedList,
+    ObjectValue, PersistenceEngine, TemplateAttribute,
+};
+use serde::Serialize;
+use std::{
+    path::PathBuf,
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tauri::{AppHandle, Manager, State};
+
+struct AppState {
+    folders: Mutex<DynamicArray<Folder>>,
+    db_path: PathBuf,
+}
+
+#[derive(Serialize)]
+struct FolderDto {
+    id: usize,
+    name: String,
+    objects: Vec<ObjectDto>,
+}
+
+#[derive(Serialize)]
+struct ObjectDto {
+    id: usize,
+    name: String,
+    description: String,
+}
+
+fn to_dto(folders: &DynamicArray<Folder>) -> Vec<FolderDto> {
+    let mut result = Vec::new();
+
+    for i in 0..folders.len() {
+        if let Some(folder) = folders.get(i) {
+            let mut objects = Vec::new();
+
+            for j in 0..folder.objects.len() {
+                if let Some(object) = folder.objects.get(j) {
+                    let description = {
+                        let mut current = &object.attributes.head;
+                        let mut text = String::new();
+
+                        while let Some(node) = current {
+                            if let ObjectValue::Text(value) = &node.data.value {
+                                text = value.clone();
+                                break;
+                            }
+                            current = &node.next;
+                        }
+
+                        text
+                    };
+
+                    objects.push(ObjectDto {
+                        id: j,
+                        name: object.title.clone(),
+                        description,
+                    });
+                }
+            }
+
+            result.push(FolderDto {
+                id: i,
+                name: folder.name.clone(),
+                objects,
+            });
+        }
+    }
+
+    result
+}
+
+fn save(folders: &DynamicArray<Folder>, path: &PathBuf) -> Result<(), String> {
+    let path = path.to_string_lossy().to_string();
+    PersistenceEngine::save_to_file(folders, &path)
+        .map_err(|error| format!("No se pudo guardar el inventario: {error}"))
+}
+
+#[tauri::command]
+fn get_inventory(state: State<'_, AppState>) -> Result<Vec<FolderDto>, String> {
+    let folders = state.folders.lock()
+        .map_err(|_| "No se pudo acceder al inventario".to_string())?;
+    Ok(to_dto(&folders))
+}
+
+#[tauri::command]
+fn create_folder(
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<FolderDto>, String> {
+    let name = name.trim();
+
+    if name.is_empty() {
+        return Err("El nombre de la carpeta no puede estar vacío".into());
+    }
+
+    let mut folders = state.folders.lock()
+        .map_err(|_| "No se pudo acceder al inventario".to_string())?;
+
+    if (0..folders.len()).any(|i| {
+        folders.get(i).is_some_and(|f| f.name.eq_ignore_ascii_case(name))
+    }) {
+        return Err("Ya existe una carpeta con ese nombre".into());
+    }
+
+    let mut template = LinkedList::new();
+    template.push_back(TemplateAttribute::Text {
+        title: "Descripción".into(),
+    });
+
+    folders.append(Folder {
+        name: name.to_string(),
+        template,
+        objects: DynamicArray::new(5),
+    });
+
+    save(&folders, &state.db_path)?;
+    Ok(to_dto(&folders))
+}
+
+#[tauri::command]
+fn create_object(
+    folder_index: usize,
+    name: String,
+    description: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<FolderDto>, String> {
+    let name = name.trim();
+
+    if name.is_empty() {
+        return Err("El nombre del objeto no puede estar vacío".into());
+    }
+
+    let mut folders = state.folders.lock()
+        .map_err(|_| "No se pudo acceder al inventario".to_string())?;
+
+    let folder = folders.get_mut(folder_index)
+        .ok_or_else(|| "La carpeta seleccionada ya no existe".to_string())?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "No se pudo generar el ID".to_string())?
+        .as_nanos();
+
+    let mut attributes = LinkedList::new();
+    let mut description_used = false;
+    let mut template_node = &folder.template.head;
+
+    while let Some(node) = template_node {
+        let value = match &node.data {
+            TemplateAttribute::Text { .. } => {
+                if !description_used {
+                    description_used = true;
+                    ObjectValue::Text(description.clone())
+                } else {
+                    ObjectValue::Text(String::new())
+                }
+            }
+            TemplateAttribute::SingleTag { .. } => ObjectValue::SingleTag(String::new()),
+            TemplateAttribute::TagSlider { .. } => ObjectValue::TagSlider(0),
+            TemplateAttribute::Checkbox { .. } => ObjectValue::Checkbox(false),
+        };
+
+        attributes.push_back(AttributeValue {
+            value,
+            visible: true,
+        });
+
+        template_node = &node.next;
+    }
+
+    folder.objects.append(InventoryObject {
+        id: timestamp.to_string(),
+        title: name.to_string(),
+        fallback_images: DynamicArray::new(2),
+        attributes,
+    });
+
+    save(&folders, &state.db_path)?;
+    Ok(to_dto(&folders))
+}
+
+#[tauri::command]
+fn delete_object(
+    folder_index: usize,
+    object_index: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<FolderDto>, String> {
+    let mut folders = state.folders.lock()
+        .map_err(|_| "No se pudo acceder al inventario".to_string())?;
+
+    let folder = folders.get_mut(folder_index)
+        .ok_or_else(|| "La carpeta seleccionada ya no existe".to_string())?;
+
+    if folder.objects.remove(object_index).is_none() {
+        return Err("El objeto seleccionado ya no existe".into());
+    }
+
+    save(&folders, &state.db_path)?;
+    Ok(to_dto(&folders))
+}
+
+fn initialize(app: &AppHandle) -> Result<AppState, String> {
+    let data_dir = app.path().app_data_dir()
+        .map_err(|e| format!("No se encontró la carpeta de datos: {e}"))?;
+
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("No se pudo crear la carpeta de datos: {e}"))?;
+
+    let db_path = data_dir.join("inventario.db");
+
+    // La primera vez, importar la base que copiamos al proyecto.
+    if !db_path.exists() {
+        let initial_db =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../inventario.db");
+
+        if initial_db.exists() {
+            std::fs::copy(&initial_db, &db_path)
+                .map_err(|e| format!("No se pudo copiar el inventario inicial: {e}"))?;
+        }
+    }
+
+    let path_string = db_path.to_string_lossy().to_string();
+    let folders = PersistenceEngine::load_from_file(&path_string)
+        .map_err(|e| format!("No se pudo cargar el inventario: {e}"))?;
+
+    Ok(AppState {
+        folders: Mutex::new(folders),
+        db_path,
+    })
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let state = initialize(app.handle())
+                .map_err(std::io::Error::other)?;
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_inventory,
+            create_folder,
+            create_object,
+            delete_object
+        ])
+        .run(tauri::generate_context!())
+        .expect("Error al ejecutar la aplicación");
+}
